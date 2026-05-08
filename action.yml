@@ -380,9 +380,39 @@ runs:
           fi
         fi
 
-        printf '%s\n' "${PROCESSED_PATHS[@]}" > "$WORK_DIR/manifests.list"
+        if [[ "$KUSTOMIZE" == "true" ]]; then
+          printf '%s\n' "${PROCESSED_PATHS[@]}" > "$WORK_DIR/manifests.list"
 
-        echo "Prepared ${#PROCESSED_PATHS[@]} manifest path(s)"
+          echo "Prepared ${#PROCESSED_PATHS[@]} kustomize path(s)"
+        else
+          APPLY_FILES=()
+
+          for target in "${PROCESSED_PATHS[@]}"; do
+            if [[ -d "$target" ]]; then
+              while IFS= read -r -d '' f; do
+                APPLY_FILES+=("$f")
+              done < <(find "$target" -type f \( -name "*.yml" -o -name "*.yaml" -o -name "*.json" \) -print0 | sort -z)
+            elif [[ "$target" == *.yaml || "$target" == *.yml || "$target" == *.json ]]; then
+              APPLY_FILES+=("$target")
+            else
+              echo "::error::Manifest path '$target' is not a .yaml, .yml, or .json file"
+              exit 1
+            fi
+          done
+
+          if [[ ${#APPLY_FILES[@]} -eq 0 ]]; then
+            echo "::error::No manifest files found. Expected .yaml, .yml, or .json files."
+            exit 1
+          fi
+
+          printf '%s\n' "${APPLY_FILES[@]}" > "$WORK_DIR/manifests.list"
+
+          echo "Manifest files to apply:"
+          printf ' - %s\n' "${APPLY_FILES[@]}"
+
+          echo "Prepared ${#APPLY_FILES[@]} manifest file(s)"
+        fi
+
         echo "::endgroup::"
 
     - name: Apply manifests
