@@ -1,7 +1,565 @@
-name: "Kubernetes Deploy by RelyBytes"
+name: "Kubernetes Deploy"
 description: "Deploy services to a Kubernetes cluster by applying YAML manifests with namespace and rollout management"
 author: "RelyBytes"
 
 branding:
   icon: "cloud"
   color: "blue"
+
+inputs:
+  kubeconfig:
+    description: "Kubeconfig content (raw YAML or base64-encoded)"
+    required: true
+
+  context:
+    description: "Kubeconfig context to use (optional)"
+    required: false
+    default: ""
+
+  namespace:
+    description: "Target Kubernetes namespace"
+    required: true
+
+  create_namespace:
+    description: "Create the namespace if it does not exist"
+    required: false
+    default: "true"
+
+  manifests:
+    description: "Path(s) to manifest file(s) or directory (newline or comma separated)"
+    required: true
+
+  kustomize:
+    description: "Apply manifests using kustomize (-k)"
+    required: false
+    default: "false"
+
+  replacements:
+    description: |
+      Newline-separated placeholder replacements in KEY=VALUE format.
+      Example:
+        __IMAGE__=ghcr.io/myorg/api:sha
+        __VERSION__=1.2.3
+        __APP_ENV__=production
+        __HOST__=app.example.com
+    required: false
+    default: ""
+
+  set_image:
+    description: |
+      Newline-separated 'resource=container=image' entries for kubectl set image.
+      Example:
+        deployment/api=app=ghcr.io/myorg/api:sha
+        deployment/worker=worker=ghcr.io/myorg/worker:sha
+    required: false
+    default: ""
+
+  env_substitution:
+    description: "Apply envsubst to manifests using current environment variables"
+    required: false
+    default: "false"
+
+  validate:
+    description: "Run kubectl with --validate=true"
+    required: false
+    default: "true"
+
+  dry_run:
+    description: "Run kubectl apply in dry-run mode (none|client|server)"
+    required: false
+    default: "none"
+
+  prune:
+    description: "Enable kubectl --prune for declarative cleanup"
+    required: false
+    default: "false"
+
+  prune_label:
+    description: "Label selector required when prune is enabled"
+    required: false
+    default: ""
+
+  wait:
+    description: "Wait for rollout to complete after apply"
+    required: false
+    default: "true"
+
+  wait_resources:
+    description: "Newline-separated resources to wait on (e.g. deployment/api). Defaults to all deployments in the namespace."
+    required: false
+    default: ""
+
+  wait_timeout:
+    description: "Timeout for rollout wait (e.g. 300s, 5m)"
+    required: false
+    default: "300s"
+
+  kubectl_version:
+    description: "kubectl version to install (e.g. v1.30.0). Empty installs latest stable."
+    required: false
+    default: ""
+
+outputs:
+  applied_resources:
+    description: "Resources applied to the cluster"
+    value: ${{ steps.apply.outputs.applied_resources }}
+
+  rollout_status:
+    description: "Rollout status (success|failed|skipped)"
+    value: ${{ steps.rollout.outputs.rollout_status }}
+
+  deployment_time:
+    description: "Timestamp of the deployment"
+    value: ${{ steps.apply.outputs.deployment_time }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate inputs
+      shell: bash
+      env:
+        INPUT_KUBECONFIG: ${{ inputs.kubeconfig }}
+        INPUT_NAMESPACE: ${{ inputs.namespace }}
+        INPUT_MANIFESTS: ${{ inputs.manifests }}
+        INPUT_PRUNE: ${{ inputs.prune }}
+        INPUT_PRUNE_LABEL: ${{ inputs.prune_label }}
+        INPUT_DRY_RUN: ${{ inputs.dry_run }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Validating inputs"
+
+        if [[ -z "$INPUT_KUBECONFIG" ]]; then
+          echo "::error::kubeconfig is required"
+          exit 1
+        fi
+
+        if [[ -z "$INPUT_NAMESPACE" ]]; then
+          echo "::error::namespace is required"
+          exit 1
+        fi
+
+        if [[ ! "$INPUT_NAMESPACE" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+          echo "::error::Invalid namespace '$INPUT_NAMESPACE' (must follow DNS-1123 label rules)"
+          exit 1
+        fi
+
+        if [[ -z "$INPUT_MANIFESTS" ]]; then
+          echo "::error::manifests is required"
+          exit 1
+        fi
+
+        if [[ "$INPUT_PRUNE" == "true" ]] && [[ -z "$INPUT_PRUNE_LABEL" ]]; then
+          echo "::error::prune_label is required when prune is enabled"
+          exit 1
+        fi
+
+        case "$INPUT_DRY_RUN" in
+          none|client|server) ;;
+          *)
+            echo "::error::dry_run must be one of: none, client, server"
+            exit 1
+            ;;
+        esac
+
+        echo "Inputs validated successfully"
+        echo "::endgroup::"
+
+    - name: Install kubectl
+      shell: bash
+      env:
+        KUBECTL_VERSION: ${{ inputs.kubectl_version }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Installing kubectl"
+
+        if command -v kubectl >/dev/null 2>&1 && [[ -z "$KUBECTL_VERSION" ]]; then
+          echo "kubectl already available: $(kubectl version --client --output=yaml 2>/dev/null | head -3 || true)"
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        if [[ -z "$KUBECTL_VERSION" ]]; then
+          KUBECTL_VERSION="$(curl -sL https://dl.k8s.io/release/stable.txt)"
+        fi
+
+        echo "Installing kubectl $KUBECTL_VERSION"
+        curl -sLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/kubectl
+        kubectl version --client
+        echo "::endgroup::"
+
+    - name: Install envsubst
+      shell: bash
+      if: inputs.env_substitution == 'true'
+      run: |
+        set -euo pipefail
+
+        echo "::group::Installing envsubst"
+
+        if command -v envsubst >/dev/null 2>&1; then
+          echo "envsubst already available"
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        sudo apt-get update
+        sudo apt-get install -y gettext-base
+
+        echo "::endgroup::"
+
+    - name: Configure kubeconfig
+      shell: bash
+      env:
+        KCONFIG: ${{ inputs.kubeconfig }}
+        KCONTEXT: ${{ inputs.context }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Configuring kubeconfig"
+
+        mkdir -p "$HOME/.kube"
+        KUBECONFIG_PATH="$HOME/.kube/config"
+
+        if printf '%s\n' "$KCONFIG" | grep -q "^apiVersion:"; then
+          printf '%s\n' "$KCONFIG" > "$KUBECONFIG_PATH"
+        elif printf '%s\n' "$KCONFIG" | base64 -d 2>/dev/null | grep -q "^apiVersion:"; then
+          printf '%s\n' "$KCONFIG" | base64 -d > "$KUBECONFIG_PATH"
+        else
+          echo "::error::kubeconfig is neither valid YAML nor base64-encoded YAML"
+          exit 1
+        fi
+
+        chmod 600 "$KUBECONFIG_PATH"
+        echo "KUBECONFIG=$KUBECONFIG_PATH" >> "$GITHUB_ENV"
+        export KUBECONFIG="$KUBECONFIG_PATH"
+
+        if [[ -n "$KCONTEXT" ]]; then
+          kubectl config use-context "$KCONTEXT"
+        fi
+
+        echo "Active context: $(kubectl config current-context)"
+        echo "::endgroup::"
+
+    - name: Verify cluster connection
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        echo "::group::Verifying cluster connection"
+
+        if ! kubectl cluster-info >/dev/null 2>&1; then
+          echo "::error::Failed to connect to Kubernetes cluster"
+          kubectl cluster-info || true
+          exit 1
+        fi
+
+        kubectl version --output=yaml | head -20 || true
+
+        echo "Cluster connection verified"
+        echo "::endgroup::"
+
+    - name: Ensure namespace
+      shell: bash
+      env:
+        NS: ${{ inputs.namespace }}
+        CREATE_NS: ${{ inputs.create_namespace }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Ensuring namespace '$NS'"
+
+        if kubectl get namespace "$NS" >/dev/null 2>&1; then
+          echo "Namespace '$NS' exists"
+        else
+          if [[ "$CREATE_NS" == "true" ]]; then
+            kubectl create namespace "$NS"
+            echo "Namespace '$NS' created"
+          else
+            echo "::error::Namespace '$NS' does not exist and create_namespace is false"
+            exit 1
+          fi
+        fi
+
+        echo "::endgroup::"
+
+    - name: Prepare manifests
+      id: prepare
+      shell: bash
+      env:
+        MANIFESTS: ${{ inputs.manifests }}
+        REPLACEMENTS: ${{ inputs.replacements }}
+        ENV_SUBST: ${{ inputs.env_substitution }}
+        KUSTOMIZE: ${{ inputs.kustomize }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Preparing manifests"
+
+        WORK_DIR="$(mktemp -d)"
+        echo "work_dir=$WORK_DIR" >> "$GITHUB_OUTPUT"
+
+        readarray -t PATHS < <(printf '%s\n' "$MANIFESTS" | tr ',' '\n' | sed '/^[[:space:]]*$/d')
+
+        PROCESSED_PATHS=()
+
+        for p in "${PATHS[@]}"; do
+          p="$(echo "$p" | xargs)"
+          [[ -z "$p" ]] && continue
+
+          if [[ ! -e "$p" ]]; then
+            echo "::error::Manifest path '$p' does not exist"
+            exit 1
+          fi
+
+          if [[ "$KUSTOMIZE" == "true" ]]; then
+            PROCESSED_PATHS+=("$p")
+            continue
+          fi
+
+          DEST="$WORK_DIR/$(basename "$p")"
+
+          if [[ -d "$p" ]]; then
+            cp -r "$p" "$DEST"
+          else
+            cp "$p" "$DEST"
+          fi
+
+          PROCESSED_PATHS+=("$DEST")
+        done
+
+        if [[ "$KUSTOMIZE" != "true" ]]; then
+          YAML_FILES=()
+
+          for target in "${PROCESSED_PATHS[@]}"; do
+            if [[ -d "$target" ]]; then
+              while IFS= read -r -d '' f; do
+                YAML_FILES+=("$f")
+              done < <(find "$target" -type f \( -name "*.yml" -o -name "*.yaml" \) -print0)
+            elif [[ "$target" == *.yaml || "$target" == *.yml ]]; then
+              YAML_FILES+=("$target")
+            fi
+          done
+
+          escape_sed_replacement() {
+            printf '%s' "$1" | sed -e 's/[\/&|]/\\&/g'
+          }
+
+          if [[ -n "$REPLACEMENTS" ]]; then
+            echo "Applying generic placeholder replacements"
+
+            while IFS= read -r line || [[ -n "$line" ]]; do
+              line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+              [[ -z "$line" ]] && continue
+              [[ "$line" == \#* ]] && continue
+
+              if [[ "$line" != *"="* ]]; then
+                echo "::error::Invalid replacement '$line'. Expected KEY=VALUE"
+                exit 1
+              fi
+
+              KEY="${line%%=*}"
+              VALUE="${line#*=}"
+
+              KEY="$(printf '%s' "$KEY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+              if [[ -z "$KEY" ]]; then
+                echo "::error::Invalid replacement '$line'. Empty key"
+                exit 1
+              fi
+
+              SAFE_VALUE="$(escape_sed_replacement "$VALUE")"
+
+              echo "Replacing placeholder '$KEY'"
+
+              for f in "${YAML_FILES[@]}"; do
+                sed -i "s|$KEY|$SAFE_VALUE|g" "$f"
+              done
+            done <<< "$REPLACEMENTS"
+          fi
+
+          if [[ "$ENV_SUBST" == "true" ]]; then
+            echo "Running envsubst on manifests"
+
+            for f in "${YAML_FILES[@]}"; do
+              tmp="$(mktemp)"
+              envsubst < "$f" > "$tmp"
+              mv "$tmp" "$f"
+            done
+          fi
+        fi
+
+        printf '%s\n' "${PROCESSED_PATHS[@]}" > "$WORK_DIR/manifests.list"
+
+        echo "Prepared ${#PROCESSED_PATHS[@]} manifest path(s)"
+        echo "::endgroup::"
+
+    - name: Apply manifests
+      id: apply
+      shell: bash
+      env:
+        NS: ${{ inputs.namespace }}
+        VALIDATE: ${{ inputs.validate }}
+        DRY_RUN: ${{ inputs.dry_run }}
+        PRUNE: ${{ inputs.prune }}
+        PRUNE_LABEL: ${{ inputs.prune_label }}
+        KUSTOMIZE: ${{ inputs.kustomize }}
+        WORK_DIR: ${{ steps.prepare.outputs.work_dir }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Applying manifests to namespace '$NS'"
+
+        APPLY_OPTS=("--namespace" "$NS")
+
+        [[ "$VALIDATE" == "true" ]] && APPLY_OPTS+=("--validate=true") || APPLY_OPTS+=("--validate=false")
+        [[ "$DRY_RUN" != "none" ]] && APPLY_OPTS+=("--dry-run=$DRY_RUN")
+
+        if [[ "$PRUNE" == "true" ]]; then
+          APPLY_OPTS+=("--prune" "-l" "$PRUNE_LABEL")
+        fi
+
+        APPLIED=""
+
+        while IFS= read -r m; do
+          [[ -z "$m" ]] && continue
+
+          echo "Applying: $m"
+
+          if [[ "$KUSTOMIZE" == "true" ]]; then
+            OUTPUT=$(kubectl apply -k "$m" "${APPLY_OPTS[@]}" -o name 2>&1)
+          else
+            OUTPUT=$(kubectl apply -f "$m" "${APPLY_OPTS[@]}" -o name 2>&1)
+          fi
+
+          echo "$OUTPUT"
+          APPLIED+="$OUTPUT"$'\n'
+        done < "$WORK_DIR/manifests.list"
+
+        {
+          echo "applied_resources<<EOF"
+          echo "$APPLIED"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "deployment_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$GITHUB_OUTPUT"
+
+        echo "::endgroup::"
+
+    - name: Update images
+      shell: bash
+      if: inputs.set_image != '' && inputs.dry_run == 'none'
+      env:
+        NS: ${{ inputs.namespace }}
+        SET_IMAGE: ${{ inputs.set_image }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Updating images via 'kubectl set image'"
+
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          line="$(echo "$line" | xargs)"
+          [[ -z "$line" ]] && continue
+
+          if [[ "$line" != *"="*"="* ]]; then
+            echo "::error::Invalid set_image entry '$line' (expected 'resource=container=image')"
+            exit 1
+          fi
+
+          RESOURCE="${line%%=*}"
+          REMAINDER="${line#*=}"
+          CONTAINER="${REMAINDER%%=*}"
+          IMAGE_VALUE="${REMAINDER#*=}"
+
+          if [[ -z "$RESOURCE" ]] || [[ -z "$CONTAINER" ]] || [[ -z "$IMAGE_VALUE" ]] || [[ "$IMAGE_VALUE" == "$REMAINDER" ]]; then
+            echo "::error::Invalid set_image entry '$line' (expected 'resource=container=image')"
+            exit 1
+          fi
+
+          echo "Setting $RESOURCE container=$CONTAINER"
+          kubectl --namespace "$NS" set image "$RESOURCE" "$CONTAINER=$IMAGE_VALUE"
+        done <<< "$SET_IMAGE"
+
+        echo "::endgroup::"
+
+    - name: Wait for rollout
+      id: rollout
+      shell: bash
+      if: inputs.wait == 'true' && inputs.dry_run == 'none'
+      env:
+        NS: ${{ inputs.namespace }}
+        WAIT_RESOURCES: ${{ inputs.wait_resources }}
+        WAIT_TIMEOUT: ${{ inputs.wait_timeout }}
+        APPLIED: ${{ steps.apply.outputs.applied_resources }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Waiting for rollout (timeout: $WAIT_TIMEOUT)"
+
+        RESOURCES=()
+
+        if [[ -n "$WAIT_RESOURCES" ]]; then
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            line="$(echo "$line" | xargs)"
+            [[ -z "$line" ]] && continue
+            RESOURCES+=("$line")
+          done <<< "$WAIT_RESOURCES"
+        else
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            line="$(echo "$line" | xargs)"
+            [[ -z "$line" ]] && continue
+
+            if [[ "$line" =~ ^(deployment|statefulset|daemonset)\..+/.+ ]] || [[ "$line" =~ ^(deployment|statefulset|daemonset)/.+ ]]; then
+              RESOURCES+=("$line")
+            fi
+          done <<< "$APPLIED"
+        fi
+
+        if [[ ${#RESOURCES[@]} -eq 0 ]]; then
+          echo "No rollout-capable resources detected, skipping wait"
+          echo "rollout_status=skipped" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        STATUS="success"
+
+        for r in "${RESOURCES[@]}"; do
+          echo "Waiting for $r"
+
+          if ! kubectl --namespace "$NS" rollout status "$r" --timeout="$WAIT_TIMEOUT"; then
+            echo "::error::Rollout failed for $r"
+            kubectl --namespace "$NS" describe "$r" || true
+            STATUS="failed"
+          fi
+        done
+
+        echo "rollout_status=$STATUS" >> "$GITHUB_OUTPUT"
+
+        if [[ "$STATUS" == "failed" ]]; then
+          exit 1
+        fi
+
+        echo "::endgroup::"
+
+    - name: Cleanup
+      shell: bash
+      if: always()
+      env:
+        WORK_DIR: ${{ steps.prepare.outputs.work_dir }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Cleanup"
+
+        rm -f "$HOME/.kube/config"
+
+        if [[ -n "${WORK_DIR:-}" ]] && [[ -d "$WORK_DIR" ]]; then
+          rm -rf "$WORK_DIR"
+        fi
+
+        echo "Cleanup completed"
+        echo "::endgroup::"
