@@ -1,0 +1,7 @@
+name: "Kubernetes Deploy by RelyBytes"
+description: "Deploy services to a Kubernetes cluster by applying YAML manifests with namespace and rollout management"
+author: "RelyBytes"
+
+branding:
+  icon: "cloud"
+  color: "blue"
