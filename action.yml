@@ -417,13 +417,25 @@ runs:
 
           echo "Applying: $m"
 
+          set +e
+
           if [[ "$KUSTOMIZE" == "true" ]]; then
             OUTPUT=$(kubectl apply -k "$m" "${APPLY_OPTS[@]}" -o name 2>&1)
+            EXIT_CODE=$?
           else
             OUTPUT=$(kubectl apply -f "$m" "${APPLY_OPTS[@]}" -o name 2>&1)
+            EXIT_CODE=$?
           fi
 
+          set -e
+
           echo "$OUTPUT"
+
+          if [[ "$EXIT_CODE" -ne 0 ]]; then
+            echo "::error::kubectl apply failed for '$m' with exit code $EXIT_CODE"
+            exit "$EXIT_CODE"
+          fi
+
           APPLIED+="$OUTPUT"$'\n'
         done < "$WORK_DIR/manifests.list"
 
