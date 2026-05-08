@@ -242,7 +242,6 @@ runs:
 
         echo "Active context: $(kubectl config current-context)"
         echo "::endgroup::"
-
     - name: Ensure namespace
       shell: bash
       env:
@@ -253,16 +252,23 @@ runs:
 
         echo "::group::Ensuring namespace '$NS'"
 
-        if kubectl get namespace "$NS" >/dev/null 2>&1; then
-          echo "Namespace '$NS' exists"
-        else
-          if [[ "$CREATE_NS" == "true" ]]; then
+        if [[ "$CREATE_NS" == "true" ]]; then
+          if kubectl get namespace "$NS" >/dev/null 2>&1; then
+            echo "Namespace '$NS' exists"
+          else
             kubectl create namespace "$NS"
             echo "Namespace '$NS' created"
-          else
-            echo "::error::Namespace '$NS' does not exist and create_namespace is false"
+          fi
+        else
+          CAN_ACCESS="$(kubectl auth can-i get pods --namespace "$NS" 2>/dev/null || true)"
+
+          if [[ "$CAN_ACCESS" != "yes" ]]; then
+            echo "::error::Cannot access namespace '$NS'. It may not exist, or the ServiceAccount has no permissions there."
+            echo "can-i get pods --namespace $NS: $CAN_ACCESS"
             exit 1
           fi
+
+          echo "Namespace '$NS' is accessible"
         fi
 
         echo "::endgroup::"
