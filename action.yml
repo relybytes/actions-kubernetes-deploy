@@ -99,6 +99,36 @@ inputs:
     required: false
     default: ""
 
+  create_registry_secret:
+    description: "Create or update a Kubernetes imagePullSecret for private registries"
+    required: false
+    default: "false"
+
+  registry_server:
+    description: "Container registry server, for example ghcr.io or registry.example.com"
+    required: false
+    default: ""
+
+  registry_username:
+    description: "Container registry username"
+    required: false
+    default: ""
+
+  registry_password:
+    description: "Container registry password or token"
+    required: false
+    default: ""
+
+  registry_email:
+    description: "Container registry email"
+    required: false
+    default: "devops@relybytes.com"
+
+  registry_secret_name:
+    description: "Kubernetes imagePullSecret name to create or update"
+    required: false
+    default: ""
+
 outputs:
   applied_resources:
     description: "Resources applied to the cluster"
@@ -124,6 +154,11 @@ runs:
         INPUT_PRUNE: ${{ inputs.prune }}
         INPUT_PRUNE_LABEL: ${{ inputs.prune_label }}
         INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        INPUT_CREATE_REGISTRY_SECRET: ${{ inputs.create_registry_secret }}
+        INPUT_REGISTRY_SERVER: ${{ inputs.registry_server }}
+        INPUT_REGISTRY_USERNAME: ${{ inputs.registry_username }}
+        INPUT_REGISTRY_PASSWORD: ${{ inputs.registry_password }}
+        INPUT_REGISTRY_SECRET_NAME: ${{ inputs.registry_secret_name }}
       run: |
         set -euo pipefail
 
@@ -161,6 +196,41 @@ runs:
             exit 1
             ;;
         esac
+
+        case "$INPUT_CREATE_REGISTRY_SECRET" in
+          true|false) ;;
+          *)
+            echo "::error::create_registry_secret must be one of: true, false"
+            exit 1
+            ;;
+        esac
+
+        if [[ "$INPUT_CREATE_REGISTRY_SECRET" == "true" ]]; then
+          if [[ -z "$INPUT_REGISTRY_SERVER" ]]; then
+            echo "::error::registry_server is required when create_registry_secret is true"
+            exit 1
+          fi
+
+          if [[ -z "$INPUT_REGISTRY_USERNAME" ]]; then
+            echo "::error::registry_username is required when create_registry_secret is true"
+            exit 1
+          fi
+
+          if [[ -z "$INPUT_REGISTRY_PASSWORD" ]]; then
+            echo "::error::registry_password is required when create_registry_secret is true"
+            exit 1
+          fi
+
+          if [[ -z "$INPUT_REGISTRY_SECRET_NAME" ]]; then
+            echo "::error::registry_secret_name is required when create_registry_secret is true"
+            exit 1
+          fi
+
+          if [[ ! "$INPUT_REGISTRY_SECRET_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+            echo "::error::Invalid registry_secret_name '$INPUT_REGISTRY_SECRET_NAME' (must follow DNS-1123 label rules)"
+            exit 1
+          fi
+        fi
 
         echo "Inputs validated successfully"
         echo "::endgroup::"
@@ -242,6 +312,7 @@ runs:
 
         echo "Active context: $(kubectl config current-context)"
         echo "::endgroup::"
+
     - name: Ensure namespace
       shell: bash
       env:
@@ -271,6 +342,34 @@ runs:
           echo "Namespace '$NS' is accessible"
         fi
 
+        echo "::endgroup::"
+
+    - name: Create or update registry pull secret
+      shell: bash
+      if: inputs.create_registry_secret == 'true' && inputs.dry_run == 'none'
+      env:
+        NS: ${{ inputs.namespace }}
+        REGISTRY_SERVER: ${{ inputs.registry_server }}
+        REGISTRY_USERNAME: ${{ inputs.registry_username }}
+        REGISTRY_PASSWORD: ${{ inputs.registry_password }}
+        REGISTRY_EMAIL: ${{ inputs.registry_email }}
+        REGISTRY_SECRET_NAME: ${{ inputs.registry_secret_name }}
+      run: |
+        set -euo pipefail
+
+        echo "::group::Creating or updating registry pull secret"
+
+        echo "::add-mask::$REGISTRY_PASSWORD"
+
+        kubectl --namespace "$NS" create secret docker-registry "$REGISTRY_SECRET_NAME" \
+          --docker-server="$REGISTRY_SERVER" \
+          --docker-username="$REGISTRY_USERNAME" \
+          --docker-password="$REGISTRY_PASSWORD" \
+          --docker-email="$REGISTRY_EMAIL" \
+          --dry-run=client \
+          -o yaml | kubectl --namespace "$NS" apply -f -
+
+        echo "Registry pull secret '$REGISTRY_SECRET_NAME' created or updated in namespace '$NS'"
         echo "::endgroup::"
 
     - name: Prepare manifests
@@ -325,8 +424,8 @@ runs:
             if [[ -d "$target" ]]; then
               while IFS= read -r -d '' f; do
                 YAML_FILES+=("$f")
-              done < <(find "$target" -type f \( -name "*.yml" -o -name "*.yaml" \) -print0)
-            elif [[ "$target" == *.yaml || "$target" == *.yml ]]; then
+              done < <(find "$target" -type f \( -name "*.yml" -o -name "*.yaml" -o -name "*.json" \) -print0 | sort -z)
+            elif [[ "$target" == *.yaml || "$target" == *.yml || "$target" == *.json ]]; then
               YAML_FILES+=("$target")
             fi
           done
@@ -542,7 +641,9 @@ runs:
             line="$(echo "$line" | xargs)"
             [[ -z "$line" ]] && continue
 
-            if [[ "$line" =~ ^(deployment|statefulset|daemonset)\..+/.+ ]] || [[ "$line" =~ ^(deployment|statefulset|daemonset)/.+ ]]; then
+            if [[ "$line" =~ ^deployment(\.apps)?/.+ ]] || \
+               [[ "$line" =~ ^statefulset(\.apps)?/.+ ]] || \
+               [[ "$line" =~ ^daemonset(\.apps)?/.+ ]]; then
               RESOURCES+=("$line")
             fi
           done <<< "$APPLIED"
