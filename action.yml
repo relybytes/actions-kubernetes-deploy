@@ -1,4 +1,4 @@
-name: "Kubernetes Deploy"
+name: "Kubernetes Deploy by RelyBytes"
 description: "Deploy services to a Kubernetes cluster by applying YAML manifests with namespace and rollout management"
 author: "RelyBytes"
 
@@ -241,24 +241,6 @@ runs:
         fi
 
         echo "Active context: $(kubectl config current-context)"
-        echo "::endgroup::"
-
-    - name: Verify cluster connection
-      shell: bash
-      run: |
-        set -euo pipefail
-
-        echo "::group::Verifying cluster connection"
-
-        if ! kubectl cluster-info >/dev/null 2>&1; then
-          echo "::error::Failed to connect to Kubernetes cluster"
-          kubectl cluster-info || true
-          exit 1
-        fi
-
-        kubectl version --output=yaml | head -20 || true
-
-        echo "Cluster connection verified"
         echo "::endgroup::"
 
     - name: Ensure namespace
