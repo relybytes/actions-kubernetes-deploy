@@ -281,6 +281,7 @@ runs:
         echo "::endgroup::"
 
     - name: Configure kubeconfig
+      id: kubeconfig
       shell: bash
       env:
         KCONFIG: ${{ inputs.kubeconfig }}
@@ -290,8 +291,11 @@ runs:
 
         echo "::group::Configuring kubeconfig"
 
-        mkdir -p "$HOME/.kube"
-        KUBECONFIG_PATH="$HOME/.kube/config"
+        # One file per run, never $HOME/.kube/config: jobs sharing a self-hosted
+        # runner share $HOME, and one job's cleanup would delete the file another
+        # job is still reading, failing its rollout wait on a deploy that worked.
+        KUBECONFIG_PATH="$(mktemp "${RUNNER_TEMP:-/tmp}/kubeconfig.XXXXXX")"
+        echo "path=$KUBECONFIG_PATH" >> "$GITHUB_OUTPUT"
 
         if printf '%s\n' "$KCONFIG" | grep -q "^apiVersion:"; then
           printf '%s\n' "$KCONFIG" > "$KUBECONFIG_PATH"
@@ -681,12 +685,15 @@ runs:
       if: always()
       env:
         WORK_DIR: ${{ steps.prepare.outputs.work_dir }}
+        KUBECONFIG_PATH: ${{ steps.kubeconfig.outputs.path }}
       run: |
         set -euo pipefail
 
         echo "::group::Cleanup"
 
-        rm -f "$HOME/.kube/config"
+        if [[ -n "${KUBECONFIG_PATH:-}" ]]; then
+          rm -f "$KUBECONFIG_PATH"
+        fi
 
         if [[ -n "${WORK_DIR:-}" ]] && [[ -d "$WORK_DIR" ]]; then
           rm -rf "$WORK_DIR"
