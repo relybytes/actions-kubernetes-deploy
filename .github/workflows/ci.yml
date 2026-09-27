@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Validate action.yml and shellcheck every step
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Ensure PyYAML is available
+        run: |
+          set -euo pipefail
+
+          if python3 -c "import yaml" 2>/dev/null; then
+            echo "PyYAML already available"
+            exit 0
+          fi
+
+          # --break-system-packages for the runner images whose system python is
+          # marked externally managed (PEP 668). The plain install is tried first,
+          # because older pip versions do not know that flag.
+          python3 -m pip install --quiet pyyaml \
+            || python3 -m pip install --quiet --break-system-packages pyyaml
+
+      - name: Install shellcheck if the runner does not have it
+        run: |
+          set -euo pipefail
+
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck --version
+            exit 0
+          fi
+
+          sudo apt-get -o DPkg::Lock::Timeout=300 update
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y shellcheck
+          shellcheck --version
+
+      - name: Check that every YAML file parses
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import pathlib
+          import sys
+
+          import yaml
+
+          paths = [pathlib.Path("action.yml")]
+          paths += sorted(pathlib.Path("examples").glob("*.yml"))
+          paths += sorted(pathlib.Path(".github/workflows").glob("*.yml"))
+
+          failed = False
+          for path in paths:
+              try:
+                  yaml.safe_load(path.read_text(encoding="utf-8"))
+              except yaml.YAMLError as error:
+                  print(f"FAIL {path}: {error}")
+                  failed = True
+              else:
+                  print(f"ok   {path}")
+
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Shellcheck every composite step
+        run: python3 scripts/lint-steps.py action.yml

@@ -5,19 +5,32 @@ on:
     branches:
       - main
 
+# One deploy at a time per environment. The action makes its own cluster
+# operations idempotent, but it cannot order two runs applying different commits
+# to the same namespace.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    # Shared self-hosted runners are the usual target. On GitHub-hosted runners
+    # use 'runs-on: ubuntu-latest' instead: the action needs no change.
+    runs-on: [self-hosted, linux]
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Deploy to Kubernetes
         uses: relybytes/actions-kubernetes-deploy@v1
         with:
-          kubeconfig: ${{ secrets.KUBECONFIG }}
+          # Raw YAML or base64-encoded YAML, stored as a secret.
+          kubeconfig: ${{ secrets.KUBECONFIG_B64 }}
           namespace: production
+          # false keeps the deploy credentials namespace-scoped: creating a
+          # namespace needs cluster-scoped rights.
+          create_namespace: "false"
           manifests: ./k8s
           replacements: |
             __IMAGE__=ghcr.io/myorg/api:${{ github.sha }}
