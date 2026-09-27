@@ -314,7 +314,27 @@ runs:
           kubectl config use-context "$KCONTEXT"
         fi
 
-        echo "Active context: $(kubectl config current-context)"
+        # Assigned first and then checked: inside 'echo "$(kubectl ...)"' a
+        # failing command substitution does not propagate under set -e, so a
+        # kubeconfig without a current context used to be reported only as an
+        # empty line here and as a confusing error several steps later.
+        CONTEXT_ERR="$(mktemp "${RUNNER_TEMP:-/tmp}/kubecontext.XXXXXX")"
+        CURRENT_CONTEXT=""
+        CURRENT_CONTEXT="$(kubectl config current-context 2>"$CONTEXT_ERR")" || true
+
+        if [[ -z "$CURRENT_CONTEXT" ]]; then
+          echo "::error::The kubeconfig has no usable current context. Set 'current-context' in the kubeconfig secret, or pass the 'context' input with the name of the context to use."
+          if [[ -s "$CONTEXT_ERR" ]]; then
+            echo "kubectl reported:"
+            cat "$CONTEXT_ERR"
+          fi
+          rm -f "$CONTEXT_ERR"
+          exit 1
+        fi
+
+        rm -f "$CONTEXT_ERR"
+
+        echo "Active context: $CURRENT_CONTEXT"
         echo "::endgroup::"
 
     - name: Ensure namespace
@@ -335,14 +355,23 @@ runs:
             echo "Namespace '$NS' created"
           fi
         else
-          CAN_ACCESS="$(kubectl auth can-i get pods --namespace "$NS" 2>/dev/null || true)"
+          # stderr is captured and printed: it is the only place that says why the
+          # check did not answer 'yes'.
+          CAN_I_ERR="$(mktemp "${RUNNER_TEMP:-/tmp}/can-i.XXXXXX")"
+          CAN_ACCESS=""
+          CAN_ACCESS="$(kubectl auth can-i get pods --namespace "$NS" 2>"$CAN_I_ERR")" || true
 
           if [[ "$CAN_ACCESS" != "yes" ]]; then
-            echo "::error::Cannot access namespace '$NS'. It may not exist, or the ServiceAccount has no permissions there."
-            echo "can-i get pods --namespace $NS: $CAN_ACCESS"
+            echo "::error::Cannot confirm access to namespace '$NS'. 'kubectl auth can-i get pods' answered '${CAN_ACCESS:-<nothing>}'. Possible causes: the namespace does not exist, the credentials have no RBAC permission in it, the kubeconfig token or client certificate has expired, or the API server is not reachable from this runner."
+            if [[ -s "$CAN_I_ERR" ]]; then
+              echo "kubectl reported:"
+              cat "$CAN_I_ERR"
+            fi
+            rm -f "$CAN_I_ERR"
             exit 1
           fi
 
+          rm -f "$CAN_I_ERR"
           echo "Namespace '$NS' is accessible"
         fi
 
@@ -365,13 +394,44 @@ runs:
 
         echo "::add-mask::$REGISTRY_PASSWORD"
 
-        kubectl --namespace "$NS" create secret docker-registry "$REGISTRY_SECRET_NAME" \
-          --docker-server="$REGISTRY_SERVER" \
-          --docker-username="$REGISTRY_USERNAME" \
-          --docker-password="$REGISTRY_PASSWORD" \
-          --docker-email="$REGISTRY_EMAIL" \
-          --dry-run=client \
-          -o yaml | kubectl --namespace "$NS" apply -f -
+        # Nothing secret goes on a command line. On these runners every job can
+        # read /proc/<pid>/cmdline of every other job, and
+        # 'kubectl create secret --docker-password=...' put the registry password
+        # there in clear for as long as the process lived. printf and base64 are a
+        # builtin and a stdin reader, so the password only ever travels through
+        # the environment and through pipes.
+        REGISTRY_AUTH="$(printf '%s:%s' "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD" | base64 | tr -d '\n')"
+        export REGISTRY_AUTH
+        echo "::add-mask::$REGISTRY_AUTH"
+
+        # A real JSON encoder, never printf: a password containing a double quote
+        # or a backslash has to be escaped to stay usable.
+        if command -v jq >/dev/null 2>&1; then
+          DOCKERCONFIG_JSON="$(jq -nc '{auths: {($ENV.REGISTRY_SERVER): {username: $ENV.REGISTRY_USERNAME, password: $ENV.REGISTRY_PASSWORD, email: $ENV.REGISTRY_EMAIL, auth: $ENV.REGISTRY_AUTH}}}')"
+        elif command -v python3 >/dev/null 2>&1; then
+          DOCKERCONFIG_JSON="$(python3 -c 'import json, os; print(json.dumps({"auths": {os.environ["REGISTRY_SERVER"]: {"username": os.environ["REGISTRY_USERNAME"], "password": os.environ["REGISTRY_PASSWORD"], "email": os.environ["REGISTRY_EMAIL"], "auth": os.environ["REGISTRY_AUTH"]}}}))')"
+        else
+          echo "::error::create_registry_secret needs jq or python3 on the runner to build the dockerconfigjson without putting the password on a command line. Install one of the two."
+          exit 1
+        fi
+
+        DOCKERCONFIG_B64="$(printf '%s' "$DOCKERCONFIG_JSON" | base64 | tr -d '\n')"
+        unset DOCKERCONFIG_JSON
+        echo "::add-mask::$DOCKERCONFIG_B64"
+
+        # The manifest only interpolates base64 output and two names already
+        # validated as DNS-1123 labels, and it is piped straight into kubectl, so
+        # it never lands on disk. apply creates or updates, as before.
+        printf '%s\n' \
+          'apiVersion: v1' \
+          'kind: Secret' \
+          'metadata:' \
+          "  name: $REGISTRY_SECRET_NAME" \
+          "  namespace: $NS" \
+          'type: kubernetes.io/dockerconfigjson' \
+          'data:' \
+          "  .dockerconfigjson: $DOCKERCONFIG_B64" \
+          | kubectl --namespace "$NS" apply -f -
 
         echo "Registry pull secret '$REGISTRY_SECRET_NAME' created or updated in namespace '$NS'"
         echo "::endgroup::"
@@ -389,7 +449,11 @@ runs:
 
         echo "::group::Preparing manifests"
 
-        WORK_DIR="$(mktemp -d)"
+        # Under RUNNER_TEMP, like the kubeconfig: these files are the fully
+        # rendered manifests, so they hold whatever the caller substituted into
+        # them, and RUNNER_TEMP belongs to this job while /tmp is shared with
+        # every other job on the runner.
+        WORK_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/manifests.XXXXXX")"
         echo "work_dir=$WORK_DIR" >> "$GITHUB_OUTPUT"
 
         readarray -t PATHS < <(printf '%s\n' "$MANIFESTS" | tr ',' '\n' | sed '/^[[:space:]]*$/d')
@@ -476,7 +540,8 @@ runs:
             echo "Running envsubst on manifests"
 
             for f in "${YAML_FILES[@]}"; do
-              tmp="$(mktemp)"
+              # Also under RUNNER_TEMP: this file holds the rendered manifest.
+              tmp="$(mktemp "${RUNNER_TEMP:-/tmp}/envsubst.XXXXXX")"
               envsubst < "$f" > "$tmp"
               mv "$tmp" "$f"
             done
