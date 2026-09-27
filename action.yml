@@ -553,8 +553,27 @@ runs:
         elif command -v python3 >/dev/null 2>&1; then
           DOCKERCONFIG_JSON="$(python3 -c 'import json, os; print(json.dumps({"auths": {os.environ["REGISTRY_SERVER"]: {"username": os.environ["REGISTRY_USERNAME"], "password": os.environ["REGISTRY_PASSWORD"], "email": os.environ["REGISTRY_EMAIL"], "auth": os.environ["REGISTRY_AUTH"]}}}))')"
         else
-          echo "::error::create_registry_secret needs jq or python3 on the runner to build the dockerconfigjson without putting the password on a command line. Install one of the two."
-          exit 1
+          # Neither encoder is installed. Rather than fail a deploy over a missing
+          # package, escape in bash: every caller of this action uses the pull
+          # secret, so this path must never depend on what the runner happens to
+          # have. Quote and backslash are the only characters a JSON string needs
+          # escaped; a control character it cannot represent is refused instead of
+          # silently producing invalid JSON.
+          for field in REGISTRY_SERVER REGISTRY_USERNAME REGISTRY_PASSWORD REGISTRY_EMAIL REGISTRY_AUTH; do
+            if [[ "${!field}" == *[$'\001'-$'\037']* ]]; then
+              echo "::error::$field contains a control character. Install jq or python3 on the runner to use a value like this, or remove the control character."
+              exit 1
+            fi
+          done
+
+          # sed, not bash substitution: "${v//\\/\\\\}" does not double a
+          # backslash, it collapses it, which silently produces invalid JSON.
+          # The value travels through a pipe, so it stays off the command line.
+          json_escape() {
+            printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+          }
+
+          DOCKERCONFIG_JSON="{\"auths\":{\"$(json_escape "$REGISTRY_SERVER")\":{\"username\":\"$(json_escape "$REGISTRY_USERNAME")\",\"password\":\"$(json_escape "$REGISTRY_PASSWORD")\",\"email\":\"$(json_escape "$REGISTRY_EMAIL")\",\"auth\":\"$(json_escape "$REGISTRY_AUTH")\"}}}"
         fi
 
         DOCKERCONFIG_B64="$(printf '%s' "$DOCKERCONFIG_JSON" | base64 | tr -d '\n')"
