@@ -21,7 +21,7 @@ inputs:
     required: true
 
   create_namespace:
-    description: "Create the namespace if it does not exist"
+    description: "Create the namespace if it does not exist. Needs cluster-scoped permission on namespaces; set it to false when the credentials are namespace-scoped."
     required: false
     default: "true"
 
@@ -30,7 +30,7 @@ inputs:
     required: true
 
   kustomize:
-    description: "Apply manifests using kustomize (-k)"
+    description: "Apply manifests using kustomize (-k). Not compatible with replacements or env_substitution."
     required: false
     default: "false"
 
@@ -55,7 +55,7 @@ inputs:
     default: ""
 
   env_substitution:
-    description: "Apply envsubst to manifests using current environment variables"
+    description: "Apply envsubst to manifests using current environment variables. Not compatible with kustomize."
     required: false
     default: "false"
 
@@ -70,7 +70,7 @@ inputs:
     default: "none"
 
   prune:
-    description: "Enable kubectl --prune for declarative cleanup"
+    description: "Enable kubectl --prune for declarative cleanup. Every manifest is then applied in a single kubectl invocation."
     required: false
     default: "false"
 
@@ -85,7 +85,13 @@ inputs:
     default: "true"
 
   wait_resources:
-    description: "Newline-separated resources to wait on (e.g. deployment/api). Defaults to all deployments in the namespace."
+    description: |
+      Newline-separated resources to wait on (e.g. deployment/api).
+      When empty, the action waits on the rollout-capable resources
+      (deployment, statefulset, daemonset) that this run applied, not on
+      everything in the namespace. A run whose manifests contain no such
+      resource therefore waits on nothing, even when set_image changed an
+      image: list the resources here when that is the case.
     required: false
     default: ""
 
@@ -131,11 +137,11 @@ inputs:
 
 outputs:
   applied_resources:
-    description: "Resources applied to the cluster"
+    description: "Resources applied to the cluster, one per line, empty when nothing was applied"
     value: ${{ steps.apply.outputs.applied_resources }}
 
   rollout_status:
-    description: "Rollout status (success|failed|skipped)"
+    description: "Rollout status (success|failed|skipped). Always one of the three, 'skipped' when wait is false, when dry_run is not none, or when nothing rollout-capable was applied."
     value: ${{ steps.rollout.outputs.rollout_status }}
 
   deployment_time:
@@ -151,6 +157,9 @@ runs:
         INPUT_KUBECONFIG: ${{ inputs.kubeconfig }}
         INPUT_NAMESPACE: ${{ inputs.namespace }}
         INPUT_MANIFESTS: ${{ inputs.manifests }}
+        INPUT_KUSTOMIZE: ${{ inputs.kustomize }}
+        INPUT_REPLACEMENTS: ${{ inputs.replacements }}
+        INPUT_ENV_SUBSTITUTION: ${{ inputs.env_substitution }}
         INPUT_PRUNE: ${{ inputs.prune }}
         INPUT_PRUNE_LABEL: ${{ inputs.prune_label }}
         INPUT_DRY_RUN: ${{ inputs.dry_run }}
@@ -182,6 +191,30 @@ runs:
         if [[ -z "$INPUT_MANIFESTS" ]]; then
           echo "::error::manifests is required"
           exit 1
+        fi
+
+        case "$INPUT_KUSTOMIZE" in
+          true|false) ;;
+          *)
+            echo "::error::kustomize must be one of: true, false"
+            exit 1
+            ;;
+        esac
+
+        # kustomize renders the manifests itself, so the placeholder and envsubst
+        # passes never see them. Failing here is better than the old behaviour,
+        # which accepted both inputs and silently deployed unsubstituted
+        # manifests.
+        if [[ "$INPUT_KUSTOMIZE" == "true" ]]; then
+          if [[ -n "$INPUT_REPLACEMENTS" ]]; then
+            echo "::error::replacements cannot be combined with kustomize: kustomize renders the manifests, so the placeholders would reach the cluster unreplaced. Use a kustomize image or configMap generator, or turn kustomize off."
+            exit 1
+          fi
+
+          if [[ "$INPUT_ENV_SUBSTITUTION" == "true" ]]; then
+            echo "::error::env_substitution cannot be combined with kustomize: envsubst would never see the rendered manifests. Turn one of the two off."
+            exit 1
+          fi
         fi
 
         if [[ "$INPUT_PRUNE" == "true" ]] && [[ -z "$INPUT_PRUNE_LABEL" ]]; then
@@ -244,30 +277,90 @@ runs:
 
         echo "::group::Installing kubectl"
 
-        if command -v kubectl >/dev/null 2>&1 && [[ -z "$KUBECTL_VERSION" ]]; then
-          echo "kubectl already available: $(kubectl version --client --output=yaml 2>/dev/null | head -3 || true)"
+        # The binary is also run, not only looked up: a kubectl left broken in a
+        # shared directory by an earlier job satisfied 'command -v' and there was
+        # no way for a later job to repair it.
+        if [[ -z "$KUBECTL_VERSION" ]] && command -v kubectl >/dev/null 2>&1 && kubectl version --client >/dev/null 2>&1; then
+          echo "kubectl already available:"
+          kubectl version --client
           echo "::endgroup::"
           exit 0
         fi
 
-        if [[ -z "$KUBECTL_VERSION" ]]; then
-          KUBECTL_VERSION="$(curl -sL https://dl.k8s.io/release/stable.txt)"
+        # The right binary for this machine, instead of the amd64 one for
+        # everybody: self-hosted runners are not all amd64 Linux.
+        case "$(uname -m)" in
+          x86_64|amd64) ARCH="amd64" ;;
+          aarch64|arm64) ARCH="arm64" ;;
+          armv7l|armv7) ARCH="arm" ;;
+          ppc64le) ARCH="ppc64le" ;;
+          s390x) ARCH="s390x" ;;
+          *)
+            echo "::error::Unsupported runner architecture '$(uname -m)'. Preinstall kubectl on this runner."
+            exit 1
+            ;;
+        esac
+
+        OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+
+        case "$OS" in
+          linux|darwin) ;;
+          *)
+            echo "::error::Unsupported runner operating system '$OS'. Preinstall kubectl on this runner."
+            exit 1
+            ;;
+        esac
+
+        if ! command -v curl >/dev/null 2>&1; then
+          echo "::error::kubectl is missing and curl is not available to download it. Preinstall kubectl, or curl, on this runner."
+          exit 1
         fi
 
-        echo "Installing kubectl $KUBECTL_VERSION"
-        curl -sLO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-        chmod +x kubectl
-        sudo mv kubectl /usr/local/bin/kubectl
+        if [[ -z "$KUBECTL_VERSION" ]]; then
+          if ! KUBECTL_VERSION="$(curl -fsSL --retry 3 https://dl.k8s.io/release/stable.txt)"; then
+            echo "::error::Could not read the current stable kubectl version from dl.k8s.io"
+            exit 1
+          fi
+        fi
+
+        # A per-job directory prepended to PATH, never /usr/local/bin: jobs from
+        # different repositories run as the same user on these runners, so
+        # installing there would replace the kubectl every other job is using.
+        # Nothing machine-wide is touched and no sudo is needed.
+        INSTALL_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/kubectl.XXXXXX")"
+        chmod 700 "$INSTALL_DIR"
+        DOWNLOAD_URL="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/${OS}/${ARCH}/kubectl"
+
+        echo "Installing kubectl $KUBECTL_VERSION for $OS/$ARCH into $INSTALL_DIR"
+
+        # -f, so an HTTP error page is never saved and installed as the binary.
+        if ! curl -fsSL --retry 3 -o "$INSTALL_DIR/kubectl" "$DOWNLOAD_URL"; then
+          echo "::error::Download of kubectl failed: $DOWNLOAD_URL"
+          rm -rf "$INSTALL_DIR"
+          exit 1
+        fi
+
+        chmod +x "$INSTALL_DIR/kubectl"
+
+        if ! "$INSTALL_DIR/kubectl" version --client >/dev/null 2>&1; then
+          echo "::error::The downloaded file does not run as kubectl, so it was not installed: $DOWNLOAD_URL"
+          rm -rf "$INSTALL_DIR"
+          exit 1
+        fi
+
+        echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+        export PATH="$INSTALL_DIR:$PATH"
+
         kubectl version --client
         echo "::endgroup::"
 
-    - name: Install envsubst
+    - name: Ensure envsubst
       shell: bash
-      if: inputs.env_substitution == 'true'
+      if: inputs.env_substitution == 'true' && inputs.kustomize != 'true'
       run: |
         set -euo pipefail
 
-        echo "::group::Installing envsubst"
+        echo "::group::Ensuring envsubst"
 
         if command -v envsubst >/dev/null 2>&1; then
           echo "envsubst already available"
@@ -275,9 +368,43 @@ runs:
           exit 0
         fi
 
-        sudo apt-get update
-        sudo apt-get install -y gettext-base
+        # No 'sudo apt-get install gettext-base'. On a shared self-hosted runner
+        # that needs sudo, fights the dpkg lock with the other jobs, and changes
+        # the package state of a machine this action does not own. A python3
+        # stand-in in a per-job directory on PATH does the same substitution with
+        # none of that.
+        if ! command -v python3 >/dev/null 2>&1; then
+          echo "::error::env_substitution needs envsubst (package gettext-base) or python3 on the runner, and neither is available. Preinstall one of the two."
+          exit 1
+        fi
 
+        SHIM_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/envsubst.XXXXXX")"
+        chmod 700 "$SHIM_DIR"
+
+        cat > "$SHIM_DIR/envsubst" <<'SHIM'
+        #!/usr/bin/env python3
+        """Stand-in for GNU envsubst: substitutes $VAR and ${VAR} from the
+        environment on stdin and writes the result to stdout. Like envsubst, a
+        variable that is not set becomes the empty string and anything that is not
+        a variable reference is copied through untouched."""
+        import os
+        import re
+        import sys
+
+        REFERENCE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+        def value(match: "re.Match[str]") -> str:
+            return os.environ.get(match.group(1) or match.group(2), "")
+
+
+        sys.stdout.write(REFERENCE.sub(value, sys.stdin.read()))
+        SHIM
+
+        chmod 700 "$SHIM_DIR/envsubst"
+        echo "$SHIM_DIR" >> "$GITHUB_PATH"
+
+        echo "envsubst is not installed: using a python3 stand-in from $SHIM_DIR"
         echo "::endgroup::"
 
     - name: Configure kubeconfig
@@ -307,6 +434,17 @@ runs:
         fi
 
         chmod 600 "$KUBECONFIG_PATH"
+
+        # GitHub masks the value the caller passed, not what it decodes to, so a
+        # base64 kubeconfig leaves its client key or bearer token unmasked for the
+        # rest of the job. Only the credential fields are masked: masking lines
+        # such as 'kind: Config' would just fill the log with asterisks.
+        while IFS= read -r secret_value; do
+          if [[ -n "$secret_value" ]]; then
+            echo "::add-mask::$secret_value"
+          fi
+        done < <(sed -n -E 's/^[[:space:]]*(client-key-data|client-certificate-data|token|password|id-token|refresh-token|client-secret):[[:space:]]*"?([^"[:space:]]+)"?[[:space:]]*$/\2/p' "$KUBECONFIG_PATH")
+
         echo "KUBECONFIG=$KUBECONFIG_PATH" >> "$GITHUB_ENV"
         export KUBECONFIG="$KUBECONFIG_PATH"
 
@@ -351,7 +489,11 @@ runs:
           if kubectl get namespace "$NS" >/dev/null 2>&1; then
             echo "Namespace '$NS' exists"
           else
-            kubectl create namespace "$NS"
+            # Two jobs deploying into the same namespace can both find it missing
+            # here, so the creation goes through the idempotent create|apply
+            # shape: the job that loses the race updates the namespace instead of
+            # failing with AlreadyExists.
+            kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
             echo "Namespace '$NS' created"
           fi
         else
@@ -449,21 +591,45 @@ runs:
 
         echo "::group::Preparing manifests"
 
+        # Whitespace trimming without xargs: xargs applies shell quote
+        # processing, so it ate backslashes, stripped quotes, and exited 1 on an
+        # unmatched apostrophe, killing the step with a message about xargs.
+        trim() {
+          local value="$1"
+          value="${value#"${value%%[![:space:]]*}"}"
+          value="${value%"${value##*[![:space:]]}"}"
+          printf '%s' "$value"
+        }
+
         # Under RUNNER_TEMP, like the kubeconfig: these files are the fully
         # rendered manifests, so they hold whatever the caller substituted into
         # them, and RUNNER_TEMP belongs to this job while /tmp is shared with
         # every other job on the runner.
         WORK_DIR="$(mktemp -d "${RUNNER_TEMP:-/tmp}/manifests.XXXXXX")"
+        chmod 700 "$WORK_DIR"
         echo "work_dir=$WORK_DIR" >> "$GITHUB_OUTPUT"
 
-        readarray -t PATHS < <(printf '%s\n' "$MANIFESTS" | tr ',' '\n' | sed '/^[[:space:]]*$/d')
+        readarray -t RAW_PATHS < <(printf '%s\n' "$MANIFESTS" | tr ',' '\n')
+
+        MANIFEST_PATHS=()
+
+        for raw in "${RAW_PATHS[@]}"; do
+          candidate="$(trim "$raw")"
+          [[ -z "$candidate" ]] && continue
+          MANIFEST_PATHS+=("$candidate")
+        done
+
+        # Checked before the branches: a manifests input of ',' used to reach the
+        # kustomize branch with nothing to apply and report a successful deploy.
+        if [[ ${#MANIFEST_PATHS[@]} -eq 0 ]]; then
+          echo "::error::manifests contains no usable path"
+          exit 1
+        fi
 
         PROCESSED_PATHS=()
+        PATH_INDEX=0
 
-        for p in "${PATHS[@]}"; do
-          p="$(echo "$p" | xargs)"
-          [[ -z "$p" ]] && continue
-
+        for p in "${MANIFEST_PATHS[@]}"; do
           if [[ ! -e "$p" ]]; then
             echo "::error::Manifest path '$p' does not exist"
             exit 1
@@ -474,7 +640,13 @@ runs:
             continue
           fi
 
-          DEST="$WORK_DIR/$(basename "$p")"
+          # One numbered subdirectory per input path. Copying by basename made
+          # two inputs both called deployment.yaml collide, so one of them was
+          # applied twice and the other was never applied at all.
+          PATH_INDEX=$((PATH_INDEX + 1))
+          DEST_DIR="$WORK_DIR/$PATH_INDEX"
+          mkdir -p "$DEST_DIR"
+          DEST="$DEST_DIR/$(basename "$p")"
 
           if [[ -d "$p" ]]; then
             cp -r "$p" "$DEST"
@@ -482,105 +654,114 @@ runs:
             cp "$p" "$DEST"
           fi
 
+          # The copy inherits the workspace permissions, usually world-readable,
+          # while the rendered result holds whatever was substituted into it.
+          chmod -R go-rwx "$DEST_DIR"
+
           PROCESSED_PATHS+=("$DEST")
         done
 
-        if [[ "$KUSTOMIZE" != "true" ]]; then
-          YAML_FILES=()
-
-          for target in "${PROCESSED_PATHS[@]}"; do
-            if [[ -d "$target" ]]; then
-              while IFS= read -r -d '' f; do
-                YAML_FILES+=("$f")
-              done < <(find "$target" -type f \( -name "*.yml" -o -name "*.yaml" -o -name "*.json" \) -print0 | sort -z)
-            elif [[ "$target" == *.yaml || "$target" == *.yml || "$target" == *.json ]]; then
-              YAML_FILES+=("$target")
-            fi
-          done
-
-          escape_sed_replacement() {
-            printf '%s' "$1" | sed -e 's/[\/&|]/\\&/g'
-          }
-
-          if [[ -n "$REPLACEMENTS" ]]; then
-            echo "Applying generic placeholder replacements"
-
-            while IFS= read -r line || [[ -n "$line" ]]; do
-              line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-
-              [[ -z "$line" ]] && continue
-              [[ "$line" == \#* ]] && continue
-
-              if [[ "$line" != *"="* ]]; then
-                echo "::error::Invalid replacement '$line'. Expected KEY=VALUE"
-                exit 1
-              fi
-
-              KEY="${line%%=*}"
-              VALUE="${line#*=}"
-
-              KEY="$(printf '%s' "$KEY" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-
-              if [[ -z "$KEY" ]]; then
-                echo "::error::Invalid replacement '$line'. Empty key"
-                exit 1
-              fi
-
-              SAFE_VALUE="$(escape_sed_replacement "$VALUE")"
-
-              echo "Replacing placeholder '$KEY'"
-
-              for f in "${YAML_FILES[@]}"; do
-                sed -i "s|$KEY|$SAFE_VALUE|g" "$f"
-              done
-            done <<< "$REPLACEMENTS"
-          fi
-
-          if [[ "$ENV_SUBST" == "true" ]]; then
-            echo "Running envsubst on manifests"
-
-            for f in "${YAML_FILES[@]}"; do
-              # Also under RUNNER_TEMP: this file holds the rendered manifest.
-              tmp="$(mktemp "${RUNNER_TEMP:-/tmp}/envsubst.XXXXXX")"
-              envsubst < "$f" > "$tmp"
-              mv "$tmp" "$f"
-            done
-          fi
-        fi
-
         if [[ "$KUSTOMIZE" == "true" ]]; then
-          printf '%s\n' "${PROCESSED_PATHS[@]}" > "$WORK_DIR/manifests.list"
-
-          echo "Prepared ${#PROCESSED_PATHS[@]} kustomize path(s)"
-        else
-          APPLY_FILES=()
-
-          for target in "${PROCESSED_PATHS[@]}"; do
-            if [[ -d "$target" ]]; then
-              while IFS= read -r -d '' f; do
-                APPLY_FILES+=("$f")
-              done < <(find "$target" -type f \( -name "*.yml" -o -name "*.yaml" -o -name "*.json" \) -print0 | sort -z)
-            elif [[ "$target" == *.yaml || "$target" == *.yml || "$target" == *.json ]]; then
-              APPLY_FILES+=("$target")
-            else
-              echo "::error::Manifest path '$target' is not a .yaml, .yml, or .json file"
-              exit 1
-            fi
-          done
-
-          if [[ ${#APPLY_FILES[@]} -eq 0 ]]; then
-            echo "::error::No manifest files found. Expected .yaml, .yml, or .json files."
+          if [[ ${#PROCESSED_PATHS[@]} -eq 0 ]]; then
+            echo "::error::No kustomize path to apply"
             exit 1
           fi
 
-          printf '%s\n' "${APPLY_FILES[@]}" > "$WORK_DIR/manifests.list"
+          printf '%s\n' "${PROCESSED_PATHS[@]}" > "$WORK_DIR/manifests.list"
 
-          echo "Manifest files to apply:"
-          printf ' - %s\n' "${APPLY_FILES[@]}"
-
-          echo "Prepared ${#APPLY_FILES[@]} manifest file(s)"
+          echo "Kustomize paths to apply:"
+          printf ' - %s\n' "${PROCESSED_PATHS[@]}"
+          echo "Prepared ${#PROCESSED_PATHS[@]} kustomize path(s)"
+          echo "::endgroup::"
+          exit 0
         fi
 
+        APPLY_FILES=()
+
+        for target in "${PROCESSED_PATHS[@]}"; do
+          if [[ -d "$target" ]]; then
+            while IFS= read -r -d '' f; do
+              APPLY_FILES+=("$f")
+            done < <(find "$target" -type f \( -name "*.yml" -o -name "*.yaml" -o -name "*.json" \) -print0 | sort -z)
+          elif [[ "$target" == *.yaml || "$target" == *.yml || "$target" == *.json ]]; then
+            APPLY_FILES+=("$target")
+          else
+            echo "::error::Manifest path '$target' is not a .yaml, .yml, or .json file"
+            exit 1
+          fi
+        done
+
+        if [[ ${#APPLY_FILES[@]} -eq 0 ]]; then
+          echo "::error::No manifest files found. Expected .yaml, .yml, or .json files."
+          exit 1
+        fi
+
+        escape_sed_replacement() {
+          printf '%s' "$1" | sed -e 's/[\/&|]/\\&/g'
+        }
+
+        escape_sed_pattern() {
+          # The left-hand side of the substitution is a basic regular expression,
+          # so a placeholder such as __A.B__ used to match any character in that
+          # position. '|' is deliberately left alone: it is already literal in a
+          # BRE and '\|' would turn it into GNU alternation.
+          printf '%s' "$1" | sed -e 's/[][\.*^$]/\\&/g'
+        }
+
+        # A control character as the s/// delimiter, so a placeholder or a value
+        # containing '|' cannot end the substitution early and abort sed.
+        SED_DELIM=$'\001'
+
+        if [[ -n "$REPLACEMENTS" ]]; then
+          echo "Applying generic placeholder replacements"
+
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            line="$(trim "$line")"
+
+            [[ -z "$line" ]] && continue
+            [[ "$line" == \#* ]] && continue
+
+            if [[ "$line" != *"="* ]]; then
+              echo "::error::Invalid replacement '$line'. Expected KEY=VALUE"
+              exit 1
+            fi
+
+            KEY="$(trim "${line%%=*}")"
+            VALUE="${line#*=}"
+
+            if [[ -z "$KEY" ]]; then
+              echo "::error::Invalid replacement '$line'. Empty key"
+              exit 1
+            fi
+
+            SAFE_KEY="$(escape_sed_pattern "$KEY")"
+            SAFE_VALUE="$(escape_sed_replacement "$VALUE")"
+
+            echo "Replacing placeholder '$KEY'"
+
+            for f in "${APPLY_FILES[@]}"; do
+              sed -i "s${SED_DELIM}${SAFE_KEY}${SED_DELIM}${SAFE_VALUE}${SED_DELIM}g" "$f"
+            done
+          done <<< "$REPLACEMENTS"
+        fi
+
+        if [[ "$ENV_SUBST" == "true" ]]; then
+          echo "Running envsubst on manifests"
+
+          for f in "${APPLY_FILES[@]}"; do
+            # Also under RUNNER_TEMP: this file holds the rendered manifest.
+            tmp="$(mktemp "${RUNNER_TEMP:-/tmp}/envsubst.XXXXXX")"
+            envsubst < "$f" > "$tmp"
+            mv "$tmp" "$f"
+          done
+        fi
+
+        printf '%s\n' "${APPLY_FILES[@]}" > "$WORK_DIR/manifests.list"
+
+        echo "Manifest files to apply:"
+        printf ' - %s\n' "${APPLY_FILES[@]}"
+
+        echo "Prepared ${#APPLY_FILES[@]} manifest file(s)"
         echo "::endgroup::"
 
     - name: Apply manifests
@@ -601,47 +782,118 @@ runs:
 
         APPLY_OPTS=("--namespace" "$NS")
 
-        [[ "$VALIDATE" == "true" ]] && APPLY_OPTS+=("--validate=true") || APPLY_OPTS+=("--validate=false")
-        [[ "$DRY_RUN" != "none" ]] && APPLY_OPTS+=("--dry-run=$DRY_RUN")
+        if [[ "$VALIDATE" == "true" ]]; then
+          APPLY_OPTS+=("--validate=true")
+        else
+          APPLY_OPTS+=("--validate=false")
+        fi
+
+        if [[ "$DRY_RUN" != "none" ]]; then
+          APPLY_OPTS+=("--dry-run=$DRY_RUN")
+        fi
 
         if [[ "$PRUNE" == "true" ]]; then
           APPLY_OPTS+=("--prune" "-l" "$PRUNE_LABEL")
         fi
 
+        TARGET_FLAG="-f"
+        if [[ "$KUSTOMIZE" == "true" ]]; then
+          TARGET_FLAG="-k"
+        fi
+
+        readarray -t LIST_ENTRIES < "$WORK_DIR/manifests.list"
+
+        TARGETS=()
+
+        for entry in "${LIST_ENTRIES[@]}"; do
+          [[ -z "$entry" ]] && continue
+          TARGETS+=("$entry")
+        done
+
+        if [[ ${#TARGETS[@]} -eq 0 ]]; then
+          echo "::error::No manifest target to apply"
+          exit 1
+        fi
+
+        STDERR_FILE="$(mktemp "${RUNNER_TEMP:-/tmp}/kubectl-apply.XXXXXX")"
         APPLIED=""
 
-        while IFS= read -r m; do
-          [[ -z "$m" ]] && continue
+        apply_targets() {
+          local args=()
+          local target
+          for target in "$@"; do
+            args+=("$TARGET_FLAG" "$target")
+          done
 
-          echo "Applying: $m"
+          local output=""
+          local exit_code=0
+          output="$(kubectl apply "${args[@]}" "${APPLY_OPTS[@]}" -o name 2>"$STDERR_FILE")" || exit_code=$?
 
-          set +e
-
-          if [[ "$KUSTOMIZE" == "true" ]]; then
-            OUTPUT=$(kubectl apply -k "$m" "${APPLY_OPTS[@]}" -o name 2>&1)
-            EXIT_CODE=$?
-          else
-            OUTPUT=$(kubectl apply -f "$m" "${APPLY_OPTS[@]}" -o name 2>&1)
-            EXIT_CODE=$?
+          # kubectl warnings, for example about a deprecated API version, belong
+          # in the log and not in the applied_resources output the callers
+          # consume, so stderr is kept separate instead of folded in with 2>&1.
+          if [[ -s "$STDERR_FILE" ]]; then
+            cat "$STDERR_FILE" >&2
           fi
 
-          set -e
+          if [[ -n "$output" ]]; then
+            printf '%s\n' "$output"
+            APPLIED+="$output"$'\n'
+          fi
 
-          echo "$OUTPUT"
+          return "$exit_code"
+        }
+
+        EXIT_CODE=0
+
+        if [[ "$PRUNE" == "true" ]]; then
+          # One invocation with a -f per manifest. --prune deletes everything
+          # matching the selector that is not part of the set applied by the same
+          # command, so applying file by file made each file prune the resources
+          # of the files before it: only the last file survived and the deploy
+          # still reported success.
+          echo "Applying ${#TARGETS[@]} target(s) in a single kubectl invocation because prune is enabled:"
+          printf ' - %s\n' "${TARGETS[@]}"
+
+          apply_targets "${TARGETS[@]}" || EXIT_CODE=$?
 
           if [[ "$EXIT_CODE" -ne 0 ]]; then
-            echo "::error::kubectl apply failed for '$m' with exit code $EXIT_CODE"
+            echo "::error::kubectl apply with --prune failed with exit code $EXIT_CODE"
             exit "$EXIT_CODE"
           fi
+        else
+          for m in "${TARGETS[@]}"; do
+            echo "Applying: $m"
 
-          APPLIED+="$OUTPUT"$'\n'
-        done < "$WORK_DIR/manifests.list"
+            apply_targets "$m" || EXIT_CODE=$?
 
-        {
-          echo "applied_resources<<EOF"
-          echo "$APPLIED"
-          echo "EOF"
-        } >> "$GITHUB_OUTPUT"
+            if [[ "$EXIT_CODE" -ne 0 ]]; then
+              echo "::error::kubectl apply failed for '$m' with exit code $EXIT_CODE"
+              exit "$EXIT_CODE"
+            fi
+          done
+        fi
+
+        rm -f "$STDERR_FILE"
+
+        # No trailing newline: it made the output look non-empty when nothing had
+        # been applied.
+        APPLIED="${APPLIED%$'\n'}"
+
+        if [[ -z "$APPLIED" ]]; then
+          echo "applied_resources=" >> "$GITHUB_OUTPUT"
+        else
+          # A random delimiter rather than a fixed EOF: a line of applied content
+          # equal to the delimiter would end the value early and let the rest be
+          # read as further step outputs.
+          EOF_MARKER="applied_resources_$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+
+          {
+            printf 'applied_resources<<%s\n' "$EOF_MARKER"
+            printf '%s\n' "$APPLIED"
+            printf '%s\n' "$EOF_MARKER"
+          } >> "$GITHUB_OUTPUT"
+        fi
 
         echo "deployment_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> "$GITHUB_OUTPUT"
 
@@ -658,8 +910,15 @@ runs:
 
         echo "::group::Updating images via 'kubectl set image'"
 
+        trim() {
+          local value="$1"
+          value="${value#"${value%%[![:space:]]*}"}"
+          value="${value%"${value##*[![:space:]]}"}"
+          printf '%s' "$value"
+        }
+
         while IFS= read -r line || [[ -n "$line" ]]; do
-          line="$(echo "$line" | xargs)"
+          line="$(trim "$line")"
           [[ -z "$line" ]] && continue
 
           if [[ "$line" != *"="*"="* ]]; then
@@ -686,9 +945,10 @@ runs:
     - name: Wait for rollout
       id: rollout
       shell: bash
-      if: inputs.wait == 'true' && inputs.dry_run == 'none'
       env:
         NS: ${{ inputs.namespace }}
+        WAIT: ${{ inputs.wait }}
+        DRY_RUN: ${{ inputs.dry_run }}
         WAIT_RESOURCES: ${{ inputs.wait_resources }}
         WAIT_TIMEOUT: ${{ inputs.wait_timeout }}
         APPLIED: ${{ steps.apply.outputs.applied_resources }}
@@ -697,17 +957,41 @@ runs:
 
         echo "::group::Waiting for rollout (timeout: $WAIT_TIMEOUT)"
 
+        trim() {
+          local value="$1"
+          value="${value#"${value%%[![:space:]]*}"}"
+          value="${value%"${value##*[![:space:]]}"}"
+          printf '%s' "$value"
+        }
+
+        # The step is no longer skipped by an 'if' on wait and dry_run: a skipped
+        # step produces no output, so rollout_status came back as the empty string
+        # instead of one of the three documented values.
+        if [[ "$DRY_RUN" != "none" ]]; then
+          echo "dry_run is '$DRY_RUN', so nothing reached the cluster: not waiting"
+          echo "rollout_status=skipped" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+          exit 0
+        fi
+
+        if [[ "$WAIT" != "true" ]]; then
+          echo "wait is '$WAIT': not waiting"
+          echo "rollout_status=skipped" >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+          exit 0
+        fi
+
         RESOURCES=()
 
         if [[ -n "$WAIT_RESOURCES" ]]; then
           while IFS= read -r line || [[ -n "$line" ]]; do
-            line="$(echo "$line" | xargs)"
+            line="$(trim "$line")"
             [[ -z "$line" ]] && continue
             RESOURCES+=("$line")
           done <<< "$WAIT_RESOURCES"
         else
           while IFS= read -r line || [[ -n "$line" ]]; do
-            line="$(echo "$line" | xargs)"
+            line="$(trim "$line")"
             [[ -z "$line" ]] && continue
 
             if [[ "$line" =~ ^deployment(\.apps)?/.+ ]] || \
@@ -719,7 +1003,7 @@ runs:
         fi
 
         if [[ ${#RESOURCES[@]} -eq 0 ]]; then
-          echo "No rollout-capable resources detected, skipping wait"
+          echo "No rollout-capable resource among the resources applied by this run, nothing to wait for"
           echo "rollout_status=skipped" >> "$GITHUB_OUTPUT"
           echo "::endgroup::"
           exit 0
@@ -740,6 +1024,7 @@ runs:
         echo "rollout_status=$STATUS" >> "$GITHUB_OUTPUT"
 
         if [[ "$STATUS" == "failed" ]]; then
+          echo "::endgroup::"
           exit 1
         fi
 
@@ -756,13 +1041,27 @@ runs:
 
         echo "::group::Cleanup"
 
-        if [[ -n "${KUBECONFIG_PATH:-}" ]]; then
-          rm -f "$KUBECONFIG_PATH"
+        # Only paths this run created under the temp root are removed, and both
+        # checks tolerate a step that never ran and a second cleanup pass.
+        TEMP_ROOT="${RUNNER_TEMP:-/tmp}"
+
+        if [[ -n "${KUBECONFIG_PATH:-}" ]] && [[ "$KUBECONFIG_PATH" == "$TEMP_ROOT"/* ]]; then
+          rm -f -- "$KUBECONFIG_PATH"
         fi
 
-        if [[ -n "${WORK_DIR:-}" ]] && [[ -d "$WORK_DIR" ]]; then
-          rm -rf "$WORK_DIR"
+        # The variable goes with the file. Leaving KUBECONFIG pointing at a
+        # deleted path made any later kubectl in the caller's job fail against
+        # localhost:8080, which says nothing about the real cause. The action
+        # deliberately leaves no usable KUBECONFIG behind.
+        echo "KUBECONFIG=" >> "$GITHUB_ENV"
+
+        if [[ -n "${WORK_DIR:-}" ]] && [[ "$WORK_DIR" == "$TEMP_ROOT"/* ]] && [[ -d "$WORK_DIR" ]]; then
+          rm -rf -- "$WORK_DIR"
         fi
+
+        # The kubectl and envsubst directories are deliberately left in place:
+        # they are on PATH for the rest of the caller's job and hold no secret.
+        # The runner deletes RUNNER_TEMP when the job ends.
 
         echo "Cleanup completed"
         echo "::endgroup::"
